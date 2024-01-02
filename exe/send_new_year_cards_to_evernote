@@ -1,0 +1,84 @@
+#!/usr/bin/env ruby
+
+USAGE = <<USAGE
+Usage: #{File.basename(Process.argv0)} evernote_token notebook_name space_separated_tag_names [upload_path]
+USAGE
+
+require "digest/md5"
+require "logger"
+require "pathname"
+
+require "evernote_oauth"
+
+ENML_TEMPLATE = <<~EOS
+  <?xml version="1.0" encoding="UTF-8"?>
+  <!DOCTYPE en-note SYSTEM "http://xml.evernote.com/pub/enml2.dtd">
+  <en-note>
+    %{note_body}
+  </en-note>
+EOS
+
+evernote_token = ARGV.shift
+notebook_name = ARGV.shift
+tag_names = ARGV.shift&.split(/\s+/)
+new_year_cards_directory = ARGV.shift || "."
+
+if !tag_names
+  $stderr.puts(USAGE)
+  exit(1)
+end
+
+# workaround https://github.com/Evernote/evernote-sdk-ruby/pull/23
+Fixnum = Integer
+
+L = Logger.new($stdout)
+
+client = EvernoteOAuth::Client.new(token: evernote_token, sandbox: false)
+user_store = client.user_store
+api_version_ok = user_store.checkVersion(
+  "Send new year cards to Evernote",
+  Evernote::EDAM::UserStore::EDAM_VERSION_MAJOR,
+  Evernote::EDAM::UserStore::EDAM_VERSION_MINOR,
+)
+raise "Evernote API version mismatch" if !api_version_ok
+
+note_store = client.note_store
+notebook = note_store.listNotebooks.find { |n| notebook_name == n.name }
+raise "no such notebook: name=#{notebook_name.inspect}" if !notebook
+
+grouped_paths = Pathname(new_year_cards_directory).glob("*.jpg").group_by { |path|
+  path.basename.to_s.sub(/[ -][^ -]*\z/, "").gsub("-", " ")
+}
+
+grouped_paths.each.with_index(1) do |(title, paths), i|
+  resources = paths.map { |path|
+    data = Evernote::EDAM::Type::Data.new
+    data.body = path.binread
+    data.size = data.body.length
+    data.bodyHash = Digest::MD5.digest(data.body)
+
+    resource = Evernote::EDAM::Type::Resource.new
+    resource.mime = "image/jpeg"
+    resource.data = data
+    resource.attributes = Evernote::EDAM::Type::ResourceAttributes.new
+    resource.attributes.fileName = path.basename.to_s
+
+    resource
+  }
+
+  media_nodes = resources.map { |resource|
+    %Q'<en-media type="#{resource.mime}" hash="#{Digest.hexencode(resource.data.bodyHash)}"/>'
+  }
+
+  enml = ENML_TEMPLATE % {note_body: media_nodes.join}
+  note = Evernote::EDAM::Type::Note.new(
+    title:,
+    content: enml,
+    notebookGuid: notebook.guid,
+    tagNames: tag_names,
+    resources:,
+  )
+  L.info("creating note: i=#{i}/#{grouped_paths.length} title=#{note.title.inspect}")
+  created_note = note_store.createNote(evernote_token, note)
+  L.info("created note: i=#{i}/#{grouped_paths.length} guid=#{created_note.guid.inspect}")
+end
